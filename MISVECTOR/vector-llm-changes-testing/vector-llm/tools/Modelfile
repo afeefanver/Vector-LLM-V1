@@ -1,0 +1,11 @@
+# Modelfile for registering fine-tuned Vector LLM into local Ollama
+FROM ./models/vector_llm_lora/gguf/unsloth.Q4_K_M.gguf
+
+# Set default model parameters
+PARAMETER temperature 0.0
+PARAMETER top_p 0.9
+PARAMETER stop "### Instruction:"
+PARAMETER stop "### Input:"
+
+# System prompt preset for Vector LLM Microservice
+SYSTEM """You are Vector AI, an elite enterprise data intelligence and visualization assistant. You specialize in accurate intent routing, Plotly.js chart generation, and data-driven decision recommendation."""
