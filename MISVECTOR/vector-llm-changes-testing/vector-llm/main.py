@@ -222,6 +222,7 @@ async def query(req: QueryRequest, user_id: str = Depends(get_user_id)):
             result      = await decision_engine.decide(
                 query    = route.refined_query,
                 csv_data = csv_context,
+                user_id  = user_id,
             )
         except Exception:
             await _refund_credits(user_id, cost, "decision_failed")
@@ -357,6 +358,7 @@ async def decide(req: DecideRequest, user_id: str = Depends(get_user_id)):
         result = await decision_engine.decide(
             query=req.query,
             csv_data=csv_data,
+            user_id=user_id,
         )
 
         await _deduct_credits(user_id, cost, "decision", tokens_used=1200)
