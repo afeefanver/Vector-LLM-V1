@@ -1,0 +1,155 @@
+Vector LLM Microservice - Codebase Analysis Findings
+=====================================================
+Date: 2026-09-18
+Analyzed by: Kilo
+Working dir: D:\MIS\MISVECTOR\vector-llm-changes-testing\vector-llm
+
+============================================================
+SECTION 1: CRITICAL ISSUES (must fix before production)
+============================================================
+
+1. decision_engine.py:43 — Second OllamaClient instance (LEAK)
+   - decision_engine.py creates its own `ollama_client = OllamaClient(timeout=300)`
+     (line 43) instead of importing the shared singleton from llm/ollama.py
+   - main.py calls ollama_client.close() at shutdown (line 71), but that closes
+     the singleton from llm/ollama.py, NOT the one created in decision_engine.py
+   - Result: A second httpx.AsyncClient is created and NEVER closed →
+     connection pool leak on every /decide and DASHBOARD-via-/query call
+   - Fix: Replace `from llm.ollama import OllamaClient` + `ollama_client = OllamaClient(timeout=300)`
+     with `from llm.ollama import ollama_client` (same pattern as dashboard_engine.py:41)
+
+2. requirements.txt — Missing optional dependencies
+   - asyncpg (used by llm/credits.py, lazy-imported via `import asyncpg`)
+   - redis (used by llm/cache.py, lazy-imported via `import redis.asyncio as redis`)
+   - Both are documented as comments in source but not in requirements.txt
+   - Without these, credit tracking and caching silently fail-open (by design),
+     but they should be installable without reading source code
+
+3. test_ollama.py:27 — Hardcoded model name mismatch (.NOT EXCLUDED)
+   - test_ollama.py sets `GEN_MODEL = "phi3"` (line 27)
+   - .env sets `OLLAMA_MODEL=qwen2.5:7b` (overridden at runtime via pydantic-settings)
+   - test_main.py:78 asserts `client.model == GEN_MODEL` which will be "qwen2.5:7b" != "phi3"
+   - This test file is NOT excluded in pytest.ini (only test_api, test_ollama_router,
+     test_dashboard_engine, test_decision_engine are excluded)
+   - Fix: Either update GEN_MODEL to match .env, or exclude this file in pytest.ini,
+     or derive the expected model from settings
+
+4. Missing __init__.py files
+   - No __init__.py in llm/ or tests/ directories
+   - Works via Python 3.3+ namespace packages + conftest.py sys.path hacks
+   - Fragile: breaks IDE autocompletion, some linters, and certain import contexts
+   - Fix: Add empty llm/__init__.py and tests/__init__.py
+
+============================================================
+SECTION 2: IMPORTANT ISSUES (should fix for quality)
+============================================================
+
+5. ollama.py:112 — stream() hardcodes temperature
+   - complete() accepts a temperature parameter (defaults to settings.TEMP_GENERAL)
+   - stream() hardcodes `"temperature": 0.3` on line 112, ignoring settings
+   - Inconsistent: non-streaming uses settings.TEMP_GENERAL, streaming uses 0.3
+   - Fix: Use settings.TEMP_GENERAL as default, or add temperature parameter
+
+6. router.py:232 — Missing json_mode=True on LLM classification
+   - _llm_classify() calls `ollama_client.complete(prompt, max_tokens=150)` without json_mode=True
+   - The complete() method supports `format: "json"` in the payload when json_mode=True
+   - Without it, the model may not reliably output valid JSON
+   - _parse_json() has a regex fallback, but this is fragile
+   - Fix: Pass json_mode=True: `ollama_client.complete(prompt, max_tokens=150, json_mode=True)`
+
+7. main.py /decide endpoint — inconsistent exception handling structure
+   - In /decide (lines 353-370): _deduct_credits() and return result are INSIDE try block
+   - In /dashboard (lines 324-336) and /query DASHBOARD/DECISION paths (lines 191-209, 220-237):
+     _deduct_credits() is OUTSIDE try block
+   - Risk: If _deduct_credits somehow raised (it currently can't since it catches
+     CreditServiceError internally), /decide would call _refund_credits after
+     decision_engine.decide() already succeeded → unnecessary refund
+   - Fix: Move _deduct_credits() outside the try block in /decide
+
+8. FORECAST and SUMMARY intents — no specialized handlers
+   - Router classifies 5 intents: DASHBOARD, DECISION, QUESTION, FORECAST, SUMMARY
+   - /query only special-cases DASHBOARD and DECISION
+   - QUESTION, FORECAST, SUMMARY all fall through to generic LLM handler
+   - No actual time-series forecasting logic for FORECAST
+   - No summarization engine for SUMMARY
+   - Fix: Either add specialized engines for forecast/summary, or document that
+     they use the general LLM path intentionally
+
+9. dashboard_engine._prepare_context() — RAG context mishandled as raw_data
+   - In /query DASHBOARD path (main.py:193): rag.retrieve() result is passed as raw_data
+     to dashboard_engine.generate()
+   - _prepare_context() tries pd.read_csv() on the RAG string (e.g.
+     "Relevant data from uploaded files:\n\n...") — likely fails to parse as CSV
+     and falls through to truncation path, wrapping as "User-provided data:\n..."
+   - Since _prepare_context returns non-empty, rag.retrieve() inside the engine
+     is never called (the `or` short-circuits)
+   - Result: RAG context is double-processed through _prepare_context instead
+     of being used raw, and may produce malformed prompts
+   - Fix: In /query DASHBOARD path, pass raw_data="" and let dashboard_engine
+     call rag.retrieve() itself with the same user_id
+
+10. Missing .gitignore
+    - No .gitignore in project root or vector-llm/ directory
+    - __pycache__/, .pytest_cache/, chroma_data/, *.pyc, .env are unprotected
+    - Fix: Add a .gitignore file
+
+============================================================
+SECTION 3: MINOR ISSUES
+============================================================
+
+11. Stray directory "{llm,tests}"
+    - Empty directory with literal braces in name at vector-llm/{llm,tests}/
+    - Appears to be a shell brace-expansion artifact (mkdir {llm,tests} on
+      a system that didn't expand braces)
+    - Fix: Delete the directory
+
+12. eval_benchmark.py uses urllib instead of httpx
+    - The rest of the project uses httpx for HTTP calls
+    - eval_benchmark.py uses urllib.request (inconsistent)
+    - Cannot handle streaming responses (test_api.py uses httpx, but this doesn't)
+    - Fix: Migrate to httpx for consistency, or document as intentional (stdlib-only)
+
+13. config.py default OLLAMA_MODEL mismatch with docstring/comments
+    - config.py line 14: OLLAMA_MODEL = "llama3.1:8b" (default, overridden by .env to qwen2.5:7b)
+    - ollama.py docstring (lines 13-14): mentions "mistral" as default
+    - implementation_plan.md: mentions "mistral" / "phi3"
+    - No single source of truth for the "expected" default model
+    - Not a bug, but causes confusion
+
+14. main.py /query — no explicit handling for FORECAST intent
+    - Even QUESTION, FORECAST, SUMMARY all fall through to the general handler
+    - The code comment says "GENERAL intent" but the router returns Intent.QUESTION
+      (not Intent.GENERAL) — there is no Intent.GENERAL enum value
+    - The comment is misleading; the general handler catches all non-dashboard/
+      non-decision intents regardless of their specific label
+
+15. rag.py:190 — hardcoded cosine distance threshold (0.7)
+    - retrieve() filters chunks with `if dist < 0.7` (line 190)
+    - This is separate from config.CONFIDENCE_THRESHOLD (0.75) used by decision_engine
+    - The 0.7 distance threshold is not configurable via settings
+    - Fix: Add RAG_DISTANCE_THRESHOLD to config.py Settings
+
+============================================================
+SECTION 4: DESIGN OBSERVATIONS (not bugs, intentional choices)
+============================================================
+
+- Fail-open design for credits and cache: CreditServiceError and CacheServiceError
+  are caught in main.py, allowing requests to proceed without DB/Redis. This is
+  intentional and well-documented.
+
+- ChromaDB fallback: If HttpClient fails, rag.py falls back to PersistentClient
+  (embedded). This is intentional for local dev without a separate Chroma server.
+
+- Per-user ChromaDB collections (vector_docs_{user_id}) — proper multi-tenancy
+  isolation. Tests in test_rag.py verify this.
+
+- Two-stage router: keyword fast-path (no LLM call) for ~90% of queries,
+  LLM-only fallback for ambiguous input. Tested in test_router.py.
+
+- Pandas-first decision engine: statistics computed exactly by pandas, LLM only
+  interprets pre-computed numbers. Avoids model arithmetic errors.
+
+- Test strategy: test_api.py and test_ollama_router.py are integration tests
+  (require live Ollama + ChromaDB), correctly excluded in pytest.ini.
+  test_main.py uses TestClient with mocks. test_router.py and test_credits.py
+  use pure mocks. test_cache.py injects fake redis module.
